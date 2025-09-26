@@ -97,21 +97,13 @@ export class FiveMinAggregator {
     this.useOiOhlc = cfg.useOiOhlc ?? false;
     this.onFlush = cfg.onFlush;
     this.now = cfg.now ?? Date.now;
-    this.graceMs = cfg.flushGraceMs ?? 1500;
+    this.graceMs = cfg.flushGraceMs ?? 1000;
   }
 
   /** Mulai timer flush yang sinkron dengan boundary interval (default 5 menit) */
   start() {
     this.stop();
-    const alignDelay = this.msUntilNextBoundaryPlusGrace();
-    this.timer = setTimeout(() => {
-      this.flushAndRoll();
-      this.timer = setInterval(() => {
-        this.flushAndRoll();
-      }, this.interval) as unknown as NodeJS.Timeout;
-      (this.timer as any).unref?.();
-    }, alignDelay) as unknown as NodeJS.Timeout;
-    (this.timer as any).unref?.();
+    this.scheduleNextTick();
   }
 
   stop() {
@@ -121,6 +113,15 @@ export class FiveMinAggregator {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+  }
+
+  private scheduleNextTick() {
+    const delay = this.msUntilNextBoundaryPlusGrace();
+    this.timer = setTimeout(() => {
+      this.flushAndRoll();
+      this.scheduleNextTick();
+    }, delay) as unknown as NodeJS.Timeout;
+    (this.timer as any).unref?.();
   }
 
   /** Catat trade dari WS publicTrade (basis asset) */
