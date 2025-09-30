@@ -1,2 +1,1 @@
 TIER,Timestamp,Timeframe,Session,POI Type,Level,Level Price,Level Dist (%),Event,Previous Candle,Delta total,avg delta,Delta,Delta change (x),Avg OI change,Current OI change,OI change,Liq,MFE (%),MAE (%),RR,MFE to Trigger,Outcome
-A,2025-09-26T07:40:00.000Z,5,London,PrevD Low,Breakout,50,-4.392033751243996,-4.392033751243996,138.1759999999887,3.71243356595219,35.34014331867256,164.83400000000256,4.664214248189246,0,,,,,

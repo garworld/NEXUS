@@ -27,13 +27,30 @@ export type BreakdownData = {
   poiPrice?: number; // ex: 116_750
   poiDistancePct?: number; // ex: 0.32 (persen)
 
-  atr?: number;
+  priceATR?: number;
+  atrMode?: "long" | "short";
+  candleType?:
+    | "Green Pinbar"
+    | "Red Pinbar"
+    | "Green Inverted Pinbar"
+    | "Red Inverted Pinbar";
 };
 
 export function breakdownEmbed(data: BreakdownData, currency: string) {
-  const titleDir =
-    data.direction === "bullish" ? "Bullish Breakout" : "Bearish Breakdown";
-  const color = data.direction === "bullish" ? 0x22c55e : 0xef4444;
+  const titleDir = data.candleType
+    ? data.direction === "bullish"
+      ? "Failed Breakout"
+      : "Failed Breakdown"
+    : data.direction === "bullish"
+    ? "Bullish Breakout"
+    : "Bearish Breakdown";
+  const color = data.candleType
+    ? data.direction === "bullish"
+      ? 0xef4444
+      : 0x22c55e
+    : data.direction === "bullish"
+    ? 0x22c55e
+    : 0xef4444;
 
   const embed = new EmbedBuilder()
     .setTitle(
@@ -104,10 +121,46 @@ export function breakdownEmbed(data: BreakdownData, currency: string) {
     }
   }
 
-  lines.push(``, `Interpretation : ${data.interpretation}`);
+  lines.push(
+    ``,
+    `${
+      data.candleType
+        ? data.direction === "bullish"
+          ? "Failed Breakout Interpretation"
+          : "Failed Breakdown Interpretation"
+        : "Interpretation"
+    } : ${
+      data.candleType
+        ? data.direction === "bullish"
+          ? "Should be a strong breakout, but the candle shows no strength, high probability of breakdown from here."
+          : "Should be a strong breakdown, but the candle shows no strength, high chance of breakdown from here."
+        : data.interpretation
+    }`
+  );
 
-  if (data.atr !== undefined) {
-    lines.push(`ATR : **${data.atr.toFixed(2)} ${embedSymbol}**`); // Display ATR value
+  if (data.priceATR !== undefined) {
+    lines.push(
+      `ATR : **${formatFiat(
+        data.priceATR as number,
+        currency
+      )} ${embedSymbol}** · ${data.atrMode ? data.atrMode.toUpperCase() : ""}`
+    ); // Display ATR value
+  }
+
+  if (data.candleType !== undefined) {
+    lines.push(
+      `Candle Type: **${data.candleType}**, ${
+        data.oiNote === "long closing"
+          ? "Absorbed Liquidation | Potential Reversal"
+          : data.oiNote === "new shorts"
+          ? "Short Trapped | Potential Reversal"
+          : data.oiNote === "short closing"
+          ? "Absorbed Liquidation | Potential Reversal"
+          : data.oiNote === "new longs"
+          ? "Long Trapped | Potential Reversal"
+          : ""
+      }`
+    );
   }
 
   embed.setDescription(lines.join("\n"));

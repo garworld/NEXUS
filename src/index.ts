@@ -28,6 +28,16 @@ import {
   loadPOIFromREST,
   savePOIToRedis,
 } from "./helpers/poi-redis.js";
+import {
+  atrGateOk,
+  atrStopKeyTf,
+  AtrStopState,
+  loadAtrState,
+  saveAtrState,
+  updateAtrTrailingStop,
+  updateAtrWithTrBuffer,
+} from "./helpers/atr-redis.js";
+import { classifyCandle } from "./helpers/candle-identifier.js";
 
 const TOKEN = process.env.DISCORD_TOKEN!;
 const CHANNEL_IDS = (process.env.CHANNEL_IDS ?? process.env.CHANNEL_ID ?? "")
@@ -62,13 +72,8 @@ const ALERT_COOLDOWN_SEC = Number(process.env.ALERT_COOLDOWN_SEC ?? 300);
 // NEAR-LEVEL THRESHOLD (persen)
 const NEAR_LEVEL_PCT = Number(process.env.NEAR_LEVEL_PCT ?? 0.4);
 
-// === ATR CONFIG ===
+//ATR
 const ATR_PERIOD = Number(process.env.ATR_PERIOD ?? 5);
-const ATR_MULT = Number(process.env.ATR_MULT ?? 3.5); // mirip indikator TV default 3~4
-const ATR_METHOD: "wilder" | "ema" =
-  (process.env.ATR_METHOD as any) ?? "wilder";
-const ATR_EPS_PCT = Number(process.env.ATR_EPS_PCT ?? 0.05); // toleransi 0.05%
-const atrKeyTf = (symbol: string, tf: number) => `atr:${tf}m:${symbol}`;
 
 const symbols = (process.env.SYMBOLS?.split(",").map((s) =>
   s.trim().toUpperCase()
@@ -108,7 +113,7 @@ const tfLabel = (tf: number) => `${tf}M`;
 const aggKeyTf = (symbol: string, tf: number) => `agg:${tf}m:${symbol}`;
 const aggAvgKeyTf = (symbol: string, tf: number) => `aggavg:${tf}m:${symbol}`;
 
-// helper: kirim embed alert gabungan (DITAMBAH poi)
+// helper: kirim embed alert gabungan (DITAMBAH poi) — ATR dihapus
 async function sendCombinedAlert(
   channels: TextChannel[],
   tf: number,
@@ -118,7 +123,13 @@ async function sendCombinedAlert(
   dir: Direction,
   tier: Tier,
   poi?: { label: string; price: number; distancePct: number },
-  atrValue?: number
+  priceATR?: number,
+  atrMode?: "long" | "short",
+  candleType?:
+    | "Green Pinbar"
+    | "Red Pinbar"
+    | "Green Inverted Pinbar"
+    | "Red Inverted Pinbar"
 ) {
   const currentVol =
     (snapshot.tradeVolume ?? 0) ||
@@ -159,7 +170,9 @@ async function sendCombinedAlert(
       poiPrice: poi?.price,
       poiDistancePct: poi?.distancePct,
 
-      atr: atrValue, // Menampilkan ATR dalam embed
+      priceATR,
+      atrMode,
+      candleType,
     },
     CURRENCY
   );
@@ -268,89 +281,9 @@ initAlertsCsv({
   enabled: true,
 });
 
-type AtrState = {
-  count: number; // untuk seed atr
-  prevClose?: number; // C_{t-1}
-  atr?: number; // ATR_{t-1}
-  mode?: "long" | "short"; // arah trailing stop aktif
-  stop?: number; // level trailing stop terakhir
-  updatedAt: number;
-};
-
-function trueRange(h: number, l: number, prevClose?: number) {
-  if (!Number.isFinite(h) || !Number.isFinite(l)) return 0;
-  const hl = h - l;
-  if (prevClose === undefined || !Number.isFinite(prevClose))
-    return Math.max(hl, 0);
-  return Math.max(hl, Math.abs(h - prevClose), Math.abs(l - prevClose));
-}
-
-function nextAtr(
-  prevAtr: number | undefined,
-  tr: number,
-  n: number,
-  count: number
-) {
-  // Seed pakai SMA TR saat count < n (mendekati)
-  if (!Number.isFinite(prevAtr) || count < n) {
-    // pendekatan cepat: average incremental
-    // ATR_seed ≈ (prevAtr* (count-1) + TR) / count
-    const seeded =
-      (Math.max(0, prevAtr ?? 0) * Math.max(0, count - 1) + tr) /
-      Math.max(1, count);
-    return seeded;
-  }
-
-  const atr = prevAtr ?? 0;
-
-  if (ATR_METHOD === "ema") {
-    const alpha = 2 / (n + 1);
-    return atr + alpha * (tr - atr);
-  } else {
-    // Wilder
-    return (prevAtr! * (n - 1) + tr) / n;
-  }
-}
-
-function updateAtrStop(
-  prev: AtrState,
-  close: number,
-  atr: number,
-  mult: number
-): AtrState {
-  const ls = close - mult * atr; // long stop candidate
-  const ss = close + mult * atr; // short stop candidate
-
-  // default bootstrap
-  if (!prev.mode || !Number.isFinite(prev.stop!)) {
-    // bootstrap arah dari close vs prevClose jika mau, atau default "long"
-    return { ...prev, mode: "long", stop: ls, atr, updatedAt: Date.now() };
-  }
-
-  let mode = prev.mode;
-  let stop = prev.stop!;
-
-  if (mode === "long") {
-    // trailing naik: stop = max(stop, ls)
-    stop = Math.max(stop, ls);
-    // flip jika close < stop
-    if (close < stop) {
-      mode = "short";
-      stop = ss;
-    }
-  } else {
-    // mode short
-    // trailing turun: stop = min(stop, ss)
-    stop = Math.min(stop, ss);
-    // flip jika close > stop
-    if (close > stop) {
-      mode = "long";
-      stop = ls;
-    }
-  }
-
-  return { ...prev, mode, stop, atr, updatedAt: Date.now() };
-}
+// state lokal: prevClose per symbol+tf
+const prevCloseMap = new Map<string, number>();
+const pcKey = (symbol: string, tf: number) => `${symbol}:${tf}`;
 
 // Tutup rapi saat proses dihentikan
 process.on("SIGINT", closeAlertsCsv);
@@ -360,14 +293,16 @@ process.on("beforeExit", closeAlertsCsv);
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user?.tag}`);
 
+  // 1) redis client
   await redisClient();
 
-  // await Promise.all(symbols.map((s) => loadPOIFromRedis(s)));
-  // console.log("📌 POI state loaded from redis");
+  // 2) load POI lama dari redis
+  await Promise.all(symbols.map((s) => loadPOIFromRedis(s)));
+  console.log("📌 POI state loaded from redis");
 
-  // Ambil POI dari REST API saat bot di-start
-  await Promise.all(symbols.map((s) => loadPOIFromREST(s)));
-  console.log("📌 POI state loaded from REST API");
+  // 3) Seed dari REST: monday/prevWeek/prevDay
+  await Promise.all(symbols.map((s) => loadPOIFromREST(s, "linear")));
+  console.log("📌 POI state seeded from REST (monday/prevWeek/prevDay)");
 
   // fetch semua channel
   const alertChannels = await fetchTextChannels(CHANNEL_IDS);
@@ -381,7 +316,7 @@ client.once("ready", async () => {
     agg: new FiveMinAggregator({
       intervalMs: tf * 60 * 1000,
       useOiOhlc: false,
-      flushGraceMs: 1000,
+      flushGraceMs: 3000,
       onFlush: (rows) => onFlushPerTf(tf, rows, alertChannels),
     }),
   }));
@@ -454,6 +389,14 @@ client.once("ready", async () => {
     }
   }, 3000).unref?.();
 
+  setInterval(() => {
+    for (const s of symbols) {
+      loadPOIFromREST(s, "linear").catch((e) =>
+        console.error("[POI] weekly seed error", e)
+      );
+    }
+  }, 10 * 60 * 2000).unref?.(); // tiap 20 menit
+
   console.log("⏱️ WS aktif | Multi-TF enabled.");
 });
 
@@ -462,6 +405,47 @@ function nextEma(prev: number, x: number, nWindow: number) {
   const alpha = 2 / (N + 1);
   if (!Number.isFinite(prev) || prev === 0) return x; // seed cepat
   return prev + alpha * (x - prev);
+}
+
+function trueRange(
+  h: number,
+  l: number,
+  o: number,
+  prevClose?: number
+): number {
+  if (!Number.isFinite(h) || !Number.isFinite(l)) return 0;
+  const hl = Math.max(h - l, 0);
+  const ref = o;
+  const hc = Math.abs(h - ref);
+  const lc = Math.abs(l - ref);
+  return Math.max(hl, hc, lc);
+}
+
+function nextAtrWilderWithSeed(
+  prevAtr: number | undefined,
+  tr: number,
+  N: number,
+  count: number
+): number | undefined {
+  // kalau belum ada cukup TR, jangan hitung ATR dulu
+  if (count < ATR_PERIOD) {
+    console.log("masuk undefined");
+    return undefined;
+  }
+
+  // Seed awal (sampai ATR_PERIOD)
+  if (!Number.isFinite(prevAtr) || count < N) {
+    const seeded =
+      (Math.max(0, prevAtr ?? 0) * Math.max(0, count - 1) + tr) /
+      Math.max(1, count);
+    console.log(`masuk seeded: ${seeded}`);
+    return seeded;
+  }
+
+  // Wilder smoothing
+  const smooterResult = ((prevAtr as number) * (N - 1) + tr) / N;
+  console.log(`smoother res = ${smooterResult}`);
+  return smooterResult;
 }
 
 async function onFlushPerTf(
@@ -506,41 +490,78 @@ async function onFlushPerTf(
       `[redis:${tf}m] ${row.symbol} pushed=${status} len=${len} ts=${row.start}`
     );
 
-    // === ATR & Trailing Stop update ===
-    const aKey = atrKeyTf(row.symbol, tf);
-    const prevAtrState = await getJSON<AtrState>(aKey);
+    // === (ATR CALCULATION) ===
 
-    const prevClose =
-      prevAtrState?.prevClose ?? row.open ?? row.close ?? row.lastPrice ?? 0;
-    const tr = trueRange(row.high ?? 0, row.low ?? 0, prevClose);
+    const keyPC = pcKey(row.symbol, tf);
+    const prevClose = prevCloseMap.get(keyPC) ?? row.open;
 
-    // seed / update ATR
-    const prevCountAtr = prevAtrState?.count ?? 0;
-    const nextCountAtr = prevCountAtr + 1;
+    // Hitung TR untuk bar ini
+    const H = Number(row.high ?? 0);
+    const L = Number(row.low ?? 0);
+    const C = Number(row.close ?? row.lastPrice ?? 0);
+    const o = Number(row.open ?? 0);
 
-    const atrNow = nextAtr(
-      prevAtrState?.atr,
-      tr,
-      ATR_PERIOD,
-      Math.min(nextCountAtr, ATR_PERIOD)
+    const TR = trueRange(H, L, o, prevClose);
+
+    console.log(
+      `[TR:${tf}m] ${row.symbol} prevC=${prevClose ?? "-"} | ` +
+        `H=${H} L=${L} C=${C} -> TR=${TR}`
     );
 
-    // update trailing stop
-    const lastClose = row.close ?? row.lastPrice ?? prevClose;
-    const nextState = updateAtrStop(
-      { ...(prevAtrState ?? { count: 0, updatedAt: 0 }), prevClose },
-      lastClose,
-      atrNow,
-      ATR_MULT
-    );
+    const prev = await loadAtrState(row.symbol, tf);
+    const next = updateAtrWithTrBuffer(prev, TR, ATR_PERIOD, ATR_PERIOD);
+    await saveAtrState(row.symbol, tf, next);
 
-    // persist ATR state
-    await setJSON(aKey, {
-      ...nextState,
-      count: nextCountAtr,
-      prevClose: lastClose, // untuk TR candle berikutnya
-      updatedAt: Date.now(),
-    });
+    // Update prevClose untuk bar berikutnya
+    if (Number.isFinite(C)) prevCloseMap.set(keyPC, C);
+
+    if (next.atr === undefined) {
+      console.log(
+        `[ATR:${tf}m] ${row.symbol} TR=${TR.toFixed(2)} | seed ${
+          next.trBuf.length
+        }/${ATR_PERIOD} (min ${ATR_PERIOD}) — ATR belum dihitung`
+      );
+    } else {
+      console.log(
+        `[ATR:${tf}m] ${row.symbol} TR=${TR.toFixed(2)} | ATR=${(
+          next.atr as number
+        ).toFixed(2)} (count=${next.count})`
+      );
+    }
+
+    let atrOk = true;
+    let priceAtrActive: number | undefined;
+    let atrModeActive: "long" | "short" | undefined;
+
+    const atrNow = next.atr;
+    const mult = Number(process.env.ATR_MULT ?? 3.5);
+    const epsPct = Number(process.env.ATR_EPS_PCT ?? 0.05);
+
+    if (Number.isFinite(atrNow) && C > 0) {
+      const stopKey = atrStopKeyTf(row.symbol, tf);
+      const prevStop = (await getJSON(stopKey)) as AtrStopState | undefined;
+
+      const nextStop = updateAtrTrailingStop(
+        prevStop,
+        H,
+        L,
+        C,
+        atrNow as number,
+        mult
+      );
+      await setJSON(stopKey, nextStop);
+
+      const direction = inferDirection(row.delta);
+      atrOk = atrGateOk(direction, C, nextStop.stop, epsPct);
+
+      priceAtrActive = nextStop.stop; // <--- simpan garis aktif
+      atrModeActive = nextStop.mode;
+
+      console.log(
+        `[ATR-STOP:${tf}m] ${row.symbol} mode=${nextStop.mode} px=${C} ` +
+          `stop=${nextStop.stop?.toFixed?.(2)} pass=${atrOk}`
+      );
+    }
 
     // 2) Ambil baseline PREV (tanpa LRANGE)
     const avgKey = aggAvgKeyTf(row.symbol, tf);
@@ -586,9 +607,6 @@ async function onFlushPerTf(
       updatedAt: Date.now(),
     });
 
-    // Cache ATR Value
-    const atrValue = atrNow;
-
     console.log(
       `[redis:${tf}m] ${row.symbol} baseline -> vol=${avgVolumeNow.toFixed(
         2
@@ -619,31 +637,34 @@ async function onFlushPerTf(
     const direction = inferDirection(row.delta);
     const tier = pickTier(rvol, rdelta, roi);
 
-    // --- ATR Trailing Stop gate ---
-    const currAtr = atrNow; // dari blok ATR di atas
-    const atrState = nextState; // atau await getJSON<AtrState>(aKey) kalau dipisah
-    const atrStop = atrState?.stop;
-    const pxNow = row.close ?? row.lastPrice ?? 0;
+    // --- CANDLE INDENTIFIER---
+    let candleType:
+      | "Green Pinbar"
+      | "Red Pinbar"
+      | "Green Inverted Pinbar"
+      | "Red Inverted Pinbar"
+      | undefined = undefined;
 
-    // toleransi kecil
-    const eps = (ATR_EPS_PCT / 100) * (pxNow || 1);
+    let breaker = false;
 
-    // RULE: long hanya lolos jika price >= stop - eps
-    //       short hanya lolos jika price <= stop + eps
-    let atrOk = true;
-    if (Number.isFinite(atrStop) && pxNow) {
-      if (direction === "bullish") {
-        atrOk = pxNow >= (atrStop as number) - eps;
-      } else {
-        atrOk = pxNow <= (atrStop as number) + eps;
-      }
+    if (tier === "A" || tier === "S") {
+      const H = Number(row.high ?? 0);
+      const L = Number(row.low ?? 0);
+      const C = Number(row.close ?? row.lastPrice ?? 0);
+      const O = Number(row.open ?? 0);
+
+      const classified = classifyCandle(O, H, L, C);
+      if (classified === "green pinbar") candleType = "Green Pinbar";
+      else if (classified === "green inverted pinbar")
+        candleType = "Green Inverted Pinbar";
+      else if (classified === "red inverted pinbar")
+        candleType = "Red Inverted Pinbar";
+      else if (classified === "red pinbar") candleType = "Red Pinbar";
+
+      breaker = candleType !== undefined;
     }
 
-    if (!atrOk) {
-      console.log(
-        `[ATR gate:${tf}m] ${row.symbol} blocked by trailing stop. dir=${direction} px=${pxNow} stop=${atrStop}`
-      );
-    }
+    const gateOk = breaker ? true : atrOk;
 
     // --- NEAREST LEVEL RULE (±NEAR_LEVEL_PCT)
     const levels = getPOILevels(row.symbol);
@@ -707,16 +728,9 @@ async function onFlushPerTf(
     const nearOk =
       nearest && Number.isFinite(nearest.pct) && nearest.pct <= NEAR_LEVEL_PCT;
 
-    console.log(
-      `[near:${tf}m] ${row.symbol} poi=${
-        nearest?.label ?? "-"
-      } dist=${nearest?.pct?.toFixed(3)}% ok=${nearOk}`
-    );
-
-    const fire = enoughHistory && !!tier && nearOk && atrOk;
     const nowJakarta = new Date().toLocaleString("en-US", {
       timeZone: "Asia/Jakarta",
-      hour12: false, // pakai format 24 jam
+      hour12: false,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -725,6 +739,13 @@ async function onFlushPerTf(
       second: "2-digit",
     });
 
+    const fire = enoughHistory && !!tier && nearOk && gateOk;
+
+    console.log(
+      `[near:${tf}m] ${row.symbol} poi=${
+        nearest?.label ?? "-"
+      } dist=${nearest?.pct?.toFixed(3)}% ok=${nearOk}`
+    );
     console.log(
       `[check:${tf}m] [${nowJakarta}] hist=${enoughHistory} rvol=${rvol.toFixed(
         2
@@ -755,7 +776,9 @@ async function onFlushPerTf(
               price: nearest.price ?? 0,
               distancePct: nearest.pct,
             },
-            atrValue
+            priceAtrActive,
+            atrModeActive,
+            candleType
           );
           lastAlertAt.set(coolKey, now);
 
@@ -782,8 +805,6 @@ async function onFlushPerTf(
             volNow > 0 && (row.tradeVolume ?? 0)
               ? ((row.liquidationVol as number) / volNow) * 100
               : "";
-
-          const oiChange = (row.oiChange ?? 0) / (prevAvgOiAbs || 1);
 
           const levelLabel = nearest?.label ?? "";
           const levelPrice = nearest?.price ?? "";
