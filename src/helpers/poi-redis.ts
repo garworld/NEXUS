@@ -5,16 +5,26 @@ import {
   listReplaceHeadIfSameTs,
   CAPACITY,
 } from "../helpers/redis.js";
-import { getPOI, getPOIData, POIState, setPOI } from "./poi-tracker.js";
+import {
+  getPOI,
+  setPOI,
+  type POIState,
+  type POIEvent,
+  bootstrapPOIFromREST, // seed monday/prevWeek/prevDay dari REST v5
+} from "./poi-tracker.js";
 
-// Key naming
+// =========================
+// ====== Key helpers ======
+// =========================
 const poiCurrKey = (symbol: string) => `poi:current:${symbol}`;
 const poiPrevKey = (symbol: string) => `poi:prev:${symbol}`;
-const poiHistKey = (symbol: string) => `poi:history:${symbol}`; // ring buffer weekly history (opsional)
+const poiHistKey = (symbol: string) => `poi:history:${symbol}`; // ring buffer weekly history
 
+// ==========================
+// ===== Persist payload =====
+// ==========================
 type PersistShape = {
   symbol: string;
-  // currentWeek
   currentWeek?: {
     weekId: string;
     weekAnchorMs?: number;
@@ -22,7 +32,6 @@ type PersistShape = {
     high: number | null;
     low: number | null;
   } | null;
-  // previous week (fully closed)
   prevWeek?: {
     weekId: string;
     weekAnchorMs?: number;
@@ -30,7 +39,6 @@ type PersistShape = {
     high: number | null;
     low: number | null;
   } | null;
-  // monday this week
   monday?: {
     weekId: string;
     mondayAnchorMs?: number;
@@ -55,7 +63,9 @@ type PersistShape = {
   updatedAt: number;
 };
 
-/** Simpan state penuh (current, prev, monday). */
+// ==================================
+// ===== Persist to / load Redis =====
+// ==================================
 export async function savePOIToRedis(symbol: string, st: POIState) {
   const payload: PersistShape = {
     symbol,
@@ -107,14 +117,20 @@ export async function savePOIToRedis(symbol: string, st: POIState) {
     updatedAt: Date.now(),
   };
 
+  // Snapshot terkini
   await setJSON(poiCurrKey(symbol), payload);
 
-  // kalau ada prevWeek (baru rollover), masukkan juga ke history ring (opsional)
+  // Optional: simpan prevWeek-only untuk lookup cepat
+  if (payload.prevWeek) {
+    await setJSON(poiPrevKey(symbol), payload.prevWeek);
+  }
+
+  // Ring history mingguan (dedup head by timestamp)
   if (st.prevWeek?.weekAnchorMs) {
     const histItem = {
       symbol,
       weekId: st.prevWeek.weekId,
-      timestamp: st.prevWeek.weekAnchorMs, // pakai sebagai dedup ts
+      timestamp: st.prevWeek.weekAnchorMs, // dipakai dedup
       open: st.prevWeek.open ?? null,
       high: st.prevWeek.high ?? null,
       low: st.prevWeek.low ?? null,
@@ -123,7 +139,6 @@ export async function savePOIToRedis(symbol: string, st: POIState) {
   }
 }
 
-/** Muat state dari Redis (kalau ada) ke tracker in-memory. */
 export async function loadPOIFromRedis(symbol: string) {
   const data = await getJSON<PersistShape>(poiCurrKey(symbol));
   if (!data) return;
@@ -179,69 +194,160 @@ export async function loadPOIFromRedis(symbol: string) {
   setPOI(symbol, st);
 }
 
-// check is POI need to be update or no
-export async function shouldUpdatePOI(symbol: string) {
-  const st = getPOI(symbol);
-  const lastUpdated = st.monday?.mondayAnchorMs ?? 0;
+// =====================================
+// ===== Seed REST & need-to-update =====
+// =====================================
 
-  const currentDate = new Date();
-  const lastUpdateDate = new Date(lastUpdated);
-
-  // make sure POI has been update on monday
-  if (
-    currentDate.getDay() === 1 &&
-    lastUpdateDate.getDate() !== currentDate.getDate()
-  ) {
-    return true;
-  }
-
-  return false;
+// Anchor Senin UTC untuk tanggal ref
+function mondayUTCOfWeek(refMs: number): number {
+  const d = new Date(refMs);
+  const dow = d.getUTCDay(); // 0=Sun..6=Sat
+  const todayMid = Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate()
+  );
+  const diffToMon = (dow + 6) % 7;
+  return todayMid - diffToMon * 86400000;
 }
 
-// Fungsi untuk mendapatkan POI dari REST API
-export async function loadPOIFromREST(symbol: string) {
-  const shouldUpdate = await shouldUpdatePOI(symbol);
+/** True jika monday di state bukan Monday minggu ini → perlu REST seed */
+export async function shouldUpdatePOI(symbol: string) {
+  const st = getPOI(symbol);
+  const lastMonday = st.monday?.mondayAnchorMs ?? 0;
+  const thisMonday = mondayUTCOfWeek(Date.now());
+  return lastMonday !== thisMonday;
+}
 
-  if (shouldUpdate) {
-    const poiData = await getPOIData(symbol);
-
-    const st = {
-      currentWeek: {
-        weekId: "2025-W01", // Static data, real logic can be applied based on date range
-        open: poiData.prevWeekOpen,
-        high: poiData.prevWeekHigh,
-        low: poiData.prevWeekLow,
-      },
-      prevWeek: {
-        weekId: "2024-W52",
-        open: poiData.prevWeekOpen,
-        high: poiData.prevWeekHigh,
-        low: poiData.prevWeekLow,
-      },
-      monday: {
-        weekId: "2025-W01",
-        open: poiData.mondayOpen,
-        high: poiData.mondayHigh,
-        low: poiData.mondayLow,
-      },
-      currentDay: {
-        dayId: "2025-01-01",
-        open: poiData.prevDayOpen,
-        high: poiData.prevDayHigh,
-        low: poiData.prevDayLow,
-      },
-      prevDay: {
-        dayId: "2024-12-31",
-        open: poiData.prevDayOpen,
-        high: poiData.prevDayHigh,
-        low: poiData.prevDayLow,
-      },
-    };
-
-    // Simpan POI dalam state internal
-    setPOI(symbol, st);
-    console.log(`POI updated for ${symbol} from REST API.`);
-  } else {
-    console.log(`POI for ${symbol} is up-to-date.`);
+/** Seed monday/prevWeek/prevDay via REST, tinggalkan currentDay/currentWeek untuk WS */
+export async function loadPOIFromREST(
+  symbol: string,
+  category: "linear" | "inverse" | "spot" = "linear"
+) {
+  const need = await shouldUpdatePOI(symbol);
+  if (!need) {
+    console.log(`POI for ${symbol} is up-to-date (REST seed skipped).`);
+    return;
   }
+
+  const boot = await bootstrapPOIFromREST(symbol, { category });
+  const st = getPOI(symbol);
+
+  if (boot.prevDay) {
+    st.prevDay = {
+      dayId: boot.prevDay.dayId,
+      dayAnchorMs: boot.prevDay.dayAnchorMs,
+      open: boot.prevDay.open,
+      high: boot.prevDay.high,
+      low: boot.prevDay.low,
+    };
+  }
+
+  if (boot.prevWeek) {
+    st.prevWeek = {
+      weekId: boot.prevWeek.weekId,
+      weekAnchorMs: boot.prevWeek.weekAnchorMs,
+      open: boot.prevWeek.open,
+      high: boot.prevWeek.high,
+      low: boot.prevWeek.low,
+    };
+  }
+
+  if (boot.monday) {
+    st.monday = {
+      weekId: boot.monday.weekId,
+      mondayAnchorMs: boot.monday.mondayAnchorMs,
+      open: boot.monday.open,
+      high: boot.monday.high,
+      low: boot.monday.low,
+    };
+  }
+
+  // Biarkan currentDay/currentWeek null → WS yang isi
+  setPOI(symbol, st);
+
+  // Persist sekali setelah seed
+  await savePOIToRedis(symbol, st);
+  console.log(`POI updated & persisted for ${symbol} from REST seed.`);
+}
+
+// =========================================
+// ===== Persist dari WebSocket (hemat) =====
+// =========================================
+
+// Cache fingerprint & debounce timer per symbol
+const fpCache = new Map<
+  string,
+  { week?: string; day?: string; mon?: string }
+>();
+const debounceTimer = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Buat fingerprint sederhana untuk deteksi perubahan O/H/L per bucket */
+function makeFingerprints(st: POIState) {
+  const week = st.currentWeek
+    ? `${st.currentWeek.weekId}|${st.currentWeek.open}|${st.currentWeek.high}|${st.currentWeek.low}`
+    : "";
+  const day = st.currentDay
+    ? `${st.currentDay.dayId}|${st.currentDay.open}|${st.currentDay.high}|${st.currentDay.low}`
+    : "";
+  const mon = st.monday
+    ? `${st.monday.weekId}|${st.monday.open}|${st.monday.high}|${st.monday.low}`
+    : "";
+  return { week, day, mon };
+}
+
+/** Debounce persist 250ms untuk coalesce burst update */
+async function schedulePersist(symbol: string) {
+  if (debounceTimer.has(symbol)) {
+    clearTimeout(debounceTimer.get(symbol)!);
+  }
+  const t = setTimeout(async () => {
+    try {
+      const st = getPOI(symbol);
+      await savePOIToRedis(symbol, st);
+    } catch (e) {
+      console.error("schedulePersist error:", e);
+    } finally {
+      debounceTimer.delete(symbol);
+    }
+  }, 250);
+  debounceTimer.set(symbol, t);
+}
+
+/** Panggil ini setelah setiap `ingestCandlePOI(...)` dari WS confirm=true */
+export async function onPOIEventPersist(symbol: string, ev: POIEvent) {
+  const st = getPOI(symbol);
+  const nowFp = makeFingerprints(st);
+  const last = fpCache.get(symbol);
+
+  const isRollover =
+    ev.type === "newWeek" || ev.type === "newDay" || ev.type === "newMonday";
+
+  // Simpan segera saat rollover (penting utk konsistensi prev*)
+  if (isRollover) {
+    await savePOIToRedis(symbol, st);
+    fpCache.set(symbol, nowFp);
+    return;
+  }
+
+  const changed =
+    !last ||
+    last.week !== nowFp.week ||
+    last.day !== nowFp.day ||
+    last.mon !== nowFp.mon;
+
+  if (changed) {
+    fpCache.set(symbol, nowFp);
+    await schedulePersist(symbol);
+  }
+}
+
+// Optional helper: flush persist debounce (mis. saat shutdown)
+export async function flushPOIPersist(symbol: string) {
+  if (debounceTimer.has(symbol)) {
+    clearTimeout(debounceTimer.get(symbol)!);
+    debounceTimer.delete(symbol);
+  }
+  const st = getPOI(symbol);
+  await savePOIToRedis(symbol, st);
 }
